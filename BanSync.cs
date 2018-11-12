@@ -31,8 +31,8 @@ using System.Linq;
 
 namespace Oxide.Plugins
 {
-    [Info("BanSync", "ThibmoRozier/sqroot", "2.0.0")]
-    [Description("Syncs bans across servers.")]
+    [Info("BanSync", "ThibmoRozier/sqroot", "2.0.1")]
+    [Description("Synchronizes bans across servers.")]
     public class BanSync : RustPlugin
     {
         #region Types
@@ -141,13 +141,13 @@ namespace Oxide.Plugins
         private void LogError(string aMessage)
         {
             if (FConfigData.DataStoreType == DataStoreType.MySql) {
-                FSqlCon.Con.Close();
+                FSqlCon?.Con?.Close();
             } else {
-                FSqlite.CloseDb(FSqlCon);
+                FSqlite?.CloseDb(FSqlCon);
             }
 
             LogToFile(string.Empty, $"[{DateTime.Now.ToString("hh:mm:ss")}] ERROR > {aMessage}", this);
-            timer.Once(0.01f, () => Interface.GetMod().UnloadPlugin("DatabaseAbstract"));
+            timer.Once(0.01f, () => Interface.GetMod().UnloadPlugin("BanSync"));
         }
 
         /// <summary>
@@ -189,6 +189,39 @@ namespace Oxide.Plugins
             ).ToList();
         }
         
+        /// <summary>
+        /// Create a new "REPLACE INTO" query for bansynch
+        /// </summary>
+        /// <param name="aBans">The list of bans to insert or replace</param>
+        /// <param name="aSqlData">The resulting list of SQL data</param>
+        /// <returns>The SQL query string</returns>
+        private string CreateReplaceQuery(List<BannedPlayer> aBans, out List<object> aSqlData)
+        {
+            string sqlNewValues = "";
+            aSqlData = new List<object>();
+
+            for (int i = 0; i < aBans.Count; i++) {
+                BannedPlayer ban = aBans[i];
+                int startIndex = 3 * i;
+                sqlNewValues += $"(@{startIndex}, @{startIndex + 1}, @{startIndex + 2}), ";
+
+                /* 
+                 * IMPORTANT:
+                 *   Items must be added in the proper order, or they will get missplaced in the query
+                 */
+                if (FConfigData.DataStoreType == DataStoreType.MySql) {
+                    aSqlData.Add(ban.SteamId);
+                } else {
+                    aSqlData.Add(ban.SteamId.ToString());
+                }
+
+                aSqlData.Add(ban.Username);
+                aSqlData.Add(ban.Notes);
+            }
+
+            sqlNewValues = sqlNewValues.Remove(sqlNewValues.Length - 2);
+            return $"REPLACE INTO {CBanTableName} (UserId, Username, Notes) VALUES {sqlNewValues};";
+        }
         #endregion Utility methods
 
         #region Constants
@@ -206,15 +239,12 @@ namespace Oxide.Plugins
 
         #region Database methods
         /// <summary>
-        /// Initialize the plugin
+        /// Connect to the backend database
         /// </summary>
-        private void InitBanSync()
+        /// <returns>Success</returns>
+        private bool ConnectToDatabase()
         {
             try {
-                LogDebug($"InitBanSync > Is FConfigData NULL? {(FConfigData == null ? "yes" : "no")}");
-                LogDebug($"InitBanSync > Is FMySql NULL? {(FMySql == null ? "yes" : "no")}");
-                LogDebug($"InitBanSync > Is FSqlite NULL? {(FSqlite == null ? "yes" : "no")}");
-
                 if (FConfigData.DataStoreType == DataStoreType.MySql) {
                     FSqlCon = FMySql.OpenDb(
                         FConfigData.MySQLHost,
@@ -224,38 +254,58 @@ namespace Oxide.Plugins
                         FConfigData.MySQLPass,
                         this
                     );
-                    LogDebug($"InitBanSync > Is FSqlCon NULL? {(FSqlCon == null ? "yes" : "no")}");
+                    LogDebug($"ConnectToDatabase > Is FSqlCon NULL? {(FSqlCon == null ? "yes" : "no")}");
 
                     if (FSqlCon == null || FSqlCon.Con == null) {
-                        LogError("InitBanSync > Couldn't open the MySQL Database: " + FSqlCon.Con.State.ToString());
-                        return;
+                        LogError($"ConnectToDatabase > Couldn't open the MySQL Database: {FSqlCon.Con.State.ToString()}");
+                        return false;
                     }
+                } else {
+                    FSqlCon = FSqlite.OpenDb(FConfigData.SQLiteDb, this);
+                    LogDebug($"ConnectToDatabase > Is FSqlCon NULL? {(FSqlCon == null ? "yes" : "no")}");
 
+                    if (FSqlCon == null) {
+                        LogError("ConnectToDatabase > Couldn't open the SQLite Database.");
+                        return false;
+                    }
+                }
+
+                return true;
+            } catch (Exception e) {
+                LogError($"{e.ToString()}");
+                return false;
+            }
+        }
+
+        /// <summary>
+        /// Initialize the plugin
+        /// </summary>
+        private void InitBanSync()
+        {
+            FOldBans = GetBannedUserList();
+            LogDebug(
+                $"InitBanSync > FOldBans.Count = {FOldBans.Count}{Environment.NewLine}" +
+                $"InitBanSync > Is FConfigData NULL? {(FConfigData == null ? "yes" : "no")}{Environment.NewLine}" +
+                $"InitBanSync > Is FMySql NULL? {(FMySql == null ? "yes" : "no")}{Environment.NewLine}" +
+                $"InitBanSync > Is FSqlite NULL? {(FSqlite == null ? "yes" : "no")}"
+            );
+
+            if (ConnectToDatabase()) {
+                if (FConfigData.DataStoreType == DataStoreType.MySql) {
                     FMySql.Query(
                         new Sql(
-                            "SELECT table_name FROM information_schema.tables " +
-                            $"WHERE table_schema='{FConfigData.MySQLDb}' AND table_name='{CBanTableName}';"
+                            "SELECT table_name FROM information_schema.tables WHERE table_schema='{FConfigData.MySQLDb}' AND table_name='{CBanTableName}';"
                         ),
                         FSqlCon,
                         CreateDb
                     );
                 } else {
-                    FSqlCon = FSqlite.OpenDb(FConfigData.SQLiteDb, this);
-                    LogDebug($"InitBanSync > Is FSqlCon NULL? {(FSqlCon == null ? "yes" : "no")}");
-
-                    if (FSqlCon == null) {
-                        LogError("InitBanSync > Couldn't open the SQLite Database.");
-                        return;
-                    }
-
                     FSqlite.Query(
                         new Sql($"SELECT name FROM sqlite_master WHERE type='table' AND name='{CBanTableName}';"),
                         FSqlCon,
                         CreateDb
                     );
                 }
-            } catch (Exception e) {
-                LogError($"{e.ToString()}");
             }
         }
 
@@ -271,17 +321,13 @@ namespace Oxide.Plugins
                 if (FConfigData.DataStoreType == DataStoreType.MySql) {
                     FMySql.ExecuteNonQuery(
                         new Sql(
-                            $"CREATE TABLE IF NOT EXISTS {CBanTableName} " +
-                            "(UserId BIGINT UNSIGNED NOT NULL PRIMARY KEY, Username TEXT NOT NULL, Notes LONGTEXT NOT NULL);"
+                            $"CREATE TABLE {CBanTableName} (UserId BIGINT UNSIGNED NOT NULL PRIMARY KEY, Username TEXT NOT NULL, Notes LONGTEXT NOT NULL);"
                         ),
                         FSqlCon
                     );
                 } else {
                     FSqlite.ExecuteNonQuery(
-                        new Sql(
-                            $"CREATE TABLE IF NOT EXISTS {CBanTableName} " +
-                            "(UserId TEXT NOT NULL PRIMARY KEY UNIQUE, Username TEXT NOT NULL, Notes TEXT NOT NULL);"
-                        ),
+                        new Sql($"CREATE TABLE {CBanTableName} (UserId TEXT NOT NULL PRIMARY KEY UNIQUE, Username TEXT NOT NULL, Notes TEXT NOT NULL);"),
                         FSqlCon
                     );
                 }
@@ -296,27 +342,9 @@ namespace Oxide.Plugins
         private void FillDatabase()
         {
             if (FOldBans.Count > 0) {
-                string sqlNewValues = "";
-                List<object> sqlNewData = new List<object>();
-
-                for (int i = 0; i < FOldBans.Count; i++) {
-                    int startIndex = 3 * i;
-                    LogDebug($"FillDatabase > I = {i} ; startIndex = {startIndex}");
-                    BannedPlayer ban = FOldBans[i];
-                    sqlNewValues += $"(@{startIndex}, @{startIndex + 1}, @{startIndex + 2}), ";
-
-                    if (FConfigData.DataStoreType == DataStoreType.MySql) {
-                        sqlNewData.Add(ban.SteamId);
-                    } else {
-                        sqlNewData.Add(ban.SteamId.ToString());
-                    }
-
-                    sqlNewData.Add(ban.Username);
-                    sqlNewData.Add(ban.Notes);
-                }
-
-                sqlNewValues = sqlNewValues.Remove(sqlNewValues.Length - 2);
-                Sql query = new Sql($"REPLACE INTO {CBanTableName} (UserId, Username, Notes) VALUES {sqlNewValues};", sqlNewData.ToArray());
+                List<object> sqlNewData;
+                string replaceQueryStr = CreateReplaceQuery(FOldBans, out sqlNewData);
+                Sql query = new Sql(replaceQueryStr, sqlNewData.ToArray());
                 LogDebug($"FillDatabase > SQL = {query.SQL}");
 
                 if (FConfigData.DataStoreType == DataStoreType.MySql) {
@@ -346,9 +374,9 @@ namespace Oxide.Plugins
             );
             LogDebug($"UpdateBans > diff.NewBans.Count = {diff.NewBans.Count} ; diff.RemovedBans.Count = {diff.RemovedBans.Count}");
             diff.NewBans.ForEach(ban => {
+                BasePlayer player = BasePlayer.FindByID(ban.SteamId);
                 ServerUsers.Set(ban.SteamId, ServerUsers.UserGroup.Banned, ban.Username, ban.Notes);
                 FOldBans.Add(ban);
-                BasePlayer player = BasePlayer.FindByID(ban.SteamId);
                 player?.Kick(string.Format("Banned: {0}", ban.Notes));
             });
             diff.RemovedBans.ForEach(unban => {
@@ -368,7 +396,7 @@ namespace Oxide.Plugins
                 FSqlite.CloseDb(FSqlCon);
             }
 
-            timer.Once(20, () => { PushBans(); });
+            timer.Once(20, PushBans);
         }
         
         /// <summary>
@@ -399,36 +427,16 @@ namespace Oxide.Plugins
         /// </summary>
         private void PushBans()
         {
-            FSqlCon = FSqlite.OpenDb(FConfigData.SQLiteDb, this);
             List<BannedPlayer> bans = GetBannedUserList();
             BanDiff diff = new BanDiff(FOldBans, bans);
             Sql query = new Sql();
-
             LogDebug($"PushBans > bans.Count = {bans.Count}");
             LogDebug($"PushBans > diff.NewBans.Count = {diff.NewBans.Count} ; diff.RemovedBans.Count = {diff.RemovedBans.Count}");
 
             if (diff.NewBans.Count > 0) {
-                string sqlNewValues = "";
-                List<object> sqlNewData = new List<object>();
-
-                for (int i = 0; i < diff.NewBans.Count; i++) {
-                    int startIndex = 3 * i;
-                    LogDebug($"PushBans > I = {i} ; startIndex = {startIndex}");
-                    BannedPlayer ban = diff.NewBans[i];
-                    sqlNewValues += $"(@{startIndex}, @{startIndex + 1}, @{startIndex + 2}), ";
-
-                    if (FConfigData.DataStoreType == DataStoreType.MySql) {
-                        sqlNewData.Add(ban.SteamId);
-                    } else {
-                        sqlNewData.Add(ban.SteamId.ToString());
-                    }
-
-                    sqlNewData.Add(ban.Username);
-                    sqlNewData.Add(ban.Notes);
-                }
-
-                sqlNewValues = sqlNewValues.Remove(sqlNewValues.Length - 2);
-                query.Append($"REPLACE INTO {CBanTableName} (UserId, Username, Notes) VALUES {sqlNewValues};", sqlNewData.ToArray());
+                List<object> sqlNewData;
+                string replaceQueryStr = CreateReplaceQuery(FOldBans, out sqlNewData);
+                query.Append(replaceQueryStr, sqlNewData.ToArray());
             }
 
             if (diff.RemovedBans.Count > 0) {
@@ -437,7 +445,7 @@ namespace Oxide.Plugins
                 for (int i = 0; i < diff.RemovedBans.Count; i++) {
                     int startIndex = 3 * i;
                     BannedPlayer unban = diff.RemovedBans[i];
-                    sqlRemoveValues += FConfigData.DataStoreType == DataStoreType.MySql ? $"{unban.SteamId}, " : $"\"{unban.SteamId}\", ";
+                    sqlRemoveValues += FConfigData.DataStoreType == DataStoreType.MySql ? $"{unban.SteamId}, " : $"'{unban.SteamId}', ";
                 }
 
                 sqlRemoveValues = sqlRemoveValues.Remove(sqlRemoveValues.Length - 2);
@@ -447,10 +455,12 @@ namespace Oxide.Plugins
             if (diff.NewBans.Count > 0 || diff.RemovedBans.Count > 0) {
                 LogDebug($"PushBans > SQL = {query.SQL}");
 
-                if (FConfigData.DataStoreType == DataStoreType.MySql) {
-                    FMySql.ExecuteNonQuery(query, FSqlCon, PullBans);
-                } else {
-                    FSqlite.ExecuteNonQuery(query, FSqlCon, PullBans);
+                if (ConnectToDatabase()) {
+                    if (FConfigData.DataStoreType == DataStoreType.MySql) {
+                        FMySql.ExecuteNonQuery(query, FSqlCon, PullBans);
+                    } else {
+                        FSqlite.ExecuteNonQuery(query, FSqlCon, PullBans);
+                    }
                 }
             } else {
                 PullBans();
@@ -465,8 +475,6 @@ namespace Oxide.Plugins
         void OnServerInitialized()
         {
             LoadConfig();
-            FOldBans = GetBannedUserList();
-            LogDebug($"OnServerInitialized > FOldBans.Count = {FOldBans.Count}");
             InitBanSync();
         }
 
@@ -497,8 +505,6 @@ namespace Oxide.Plugins
             } catch {
                 LoadDefaultConfig();
             }
-
-            SaveConfig();
         }
 
         /// <summary>
@@ -508,6 +514,7 @@ namespace Oxide.Plugins
         {
             FConfigData = new ConfigData();
             LogDebug("LoadDefaultConfig > Default config loaded");
+            SaveConfig();
         }
 
         /// <summary>
