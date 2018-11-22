@@ -25,15 +25,16 @@
 using Newtonsoft.Json;
 using Oxide.Core;
 using Oxide.Core.Database;
+using Oxide.Core.Libraries.Covalence;
 using System;
 using System.Collections.Generic;
 using System.Linq;
 
 namespace Oxide.Plugins
 {
-    [Info("BanSync", "ThibmoRozier/sqroot", "2.0.1")]
+    [Info("BanSync", "ThibmoRozier", "2.0.3")]
     [Description("Synchronizes bans across servers.")]
-    public class BanSync : RustPlugin
+    public class BanSync : CovalencePlugin
     {
         #region Types
         /// <summary>
@@ -71,9 +72,9 @@ namespace Oxide.Plugins
         /// </summary>
         private class BannedPlayer
         {
-            public ulong SteamId { get; set; }
-            public string Username { get; set; }
-            public string Notes { get; set; }
+            public string Id { get; set; }
+            public string Name { get; set; }
+            public string Reason { get; set; }
         }
 
         /// <summary>
@@ -93,8 +94,7 @@ namespace Oxide.Plugins
                 if (ReferenceEquals(a, b))
                     return true;
 
-                return a != null && b != null && a.SteamId.Equals(b.SteamId) &&
-                       a.Username.Equals(b.Username) && a.Notes.Equals(b.Notes);
+                return a != null && b != null && a.Id.Equals(b.Id) && a.Name.Equals(b.Name);
             }
 
             /// <summary>
@@ -104,10 +104,9 @@ namespace Oxide.Plugins
             /// <returns></returns>
             public int GetHashCode(BannedPlayer obj)
             {
-                int steamIdHash = obj.SteamId.GetHashCode();
-                int usernameHash = obj.Username.GetHashCode();
-                int notesHash = obj.Notes.GetHashCode();
-                return steamIdHash ^ steamIdHash ^ notesHash;
+                int idHash = obj.Id.GetHashCode();
+                int nameHash = obj.Name.GetHashCode();
+                return idHash ^ nameHash;
             }
         }
 
@@ -116,8 +115,9 @@ namespace Oxide.Plugins
         /// </summary>
         private class BanDiff
         {
-            public List<BannedPlayer> NewBans = new List<BannedPlayer>();
-            public List<BannedPlayer> RemovedBans = new List<BannedPlayer>();
+            public List<BannedPlayer> NewBans;
+            public List<BannedPlayer> RemovedBans;
+            public bool NotEmpty;
 
             /// <summary>
             /// Class constructor
@@ -127,8 +127,9 @@ namespace Oxide.Plugins
             public BanDiff(List<BannedPlayer> aOldList, List<BannedPlayer> aNewList)
             {
                 CompareBannedPlayers comparer = new CompareBannedPlayers();
-                NewBans.AddRange(aNewList.Except(aOldList, comparer));
-                RemovedBans.AddRange(aOldList.Except(aNewList, comparer));
+                NewBans = aNewList.Except(aOldList, comparer).ToList();
+                RemovedBans = aOldList.Except(aNewList, comparer).ToList();
+                NotEmpty = NewBans.Count > 0 || RemovedBans.Count > 0;
             }
         }
         #endregion Types
@@ -140,14 +141,17 @@ namespace Oxide.Plugins
         /// <param name="aMessage"></param>
         private void LogError(string aMessage)
         {
-            if (FConfigData.DataStoreType == DataStoreType.MySql) {
-                FSqlCon?.Con?.Close();
-            } else {
-                FSqlite?.CloseDb(FSqlCon);
+            LogToFile(string.Empty, $"[{DateTime.Now.ToString("hh:mm:ss")}] ERROR > {aMessage}", this);
+
+            if (FSqlCon != null) {
+                if (FConfigData.DataStoreType == DataStoreType.MySql) {
+                    FSqlCon.Con?.Close();
+                } else {
+                    FSqlite.CloseDb(FSqlCon);
+                }
             }
 
-            LogToFile(string.Empty, $"[{DateTime.Now.ToString("hh:mm:ss")}] ERROR > {aMessage}", this);
-            timer.Once(0.01f, () => Interface.GetMod().UnloadPlugin("BanSync"));
+            timer.Once(0.01f, () => Interface.Oxide.UnloadPlugin("BanSync"));
         }
 
         /// <summary>
@@ -173,22 +177,28 @@ namespace Oxide.Plugins
         /// <returns></returns>
         private List<BannedPlayer> GetBannedUserList()
         {
-            List<ServerUsers.User> result = ServerUsers.GetAll(ServerUsers.UserGroup.Banned).ToList();
-            LogDebug($"GetBannedUserList > Retrieved the banned user list, result.Count = {result.Count}");
-            result.Sort((a, b) => {
-                int diff = string.Compare(a.username, b.username);
-
-                if (diff == 0)
-                    diff = a.steamid.CompareTo(b.steamid);
-
-                return diff;
-            });
+            #if RUST
+                IEnumerable<ServerUsers.User> users = ServerUsers.GetAll(ServerUsers.UserGroup.Banned).OrderBy(u => u.username).ThenBy(u => u.steamid);
+            #else
+                IEnumerable<IPlayer> users = players.All.Where(player => { return player.IsBanned; }).OrderBy(u => u.Name).ThenBy(u => u.Id);
+            #endif
+            LogDebug($"GetBannedUserList > Retrieved the banned user list, users.Count = {users.Count()}");
             return (
-                from user in result
-                select new BannedPlayer { SteamId = user.steamid, Username = user.username, Notes = user.notes }
+                from user in users
+                select new BannedPlayer {
+                    #if RUST
+                        Id = user.steamid.ToString(),
+                        Name = user.username,
+                        Reason = user.notes
+                    #else
+                        Id = user.Id,
+                        Name = user.Name,
+                        Reason = "Synched ban"
+                    #endif
+                }
             ).ToList();
         }
-        
+
         /// <summary>
         /// Create a new "REPLACE INTO" query for bansynch
         /// </summary>
@@ -197,30 +207,23 @@ namespace Oxide.Plugins
         /// <returns>The SQL query string</returns>
         private string CreateReplaceQuery(List<BannedPlayer> aBans, out List<object> aSqlData)
         {
+            int counter = 0;
             string sqlNewValues = "";
             aSqlData = new List<object>();
 
-            for (int i = 0; i < aBans.Count; i++) {
-                BannedPlayer ban = aBans[i];
-                int startIndex = 3 * i;
-                sqlNewValues += $"(@{startIndex}, @{startIndex + 1}, @{startIndex + 2}), ";
-
+            foreach (BannedPlayer player in aBans) {
+                sqlNewValues += $"(@{counter++}, @{counter++}, @{counter++}), ";
                 /* 
                  * IMPORTANT:
                  *   Items must be added in the proper order, or they will get missplaced in the query
                  */
-                if (FConfigData.DataStoreType == DataStoreType.MySql) {
-                    aSqlData.Add(ban.SteamId);
-                } else {
-                    aSqlData.Add(ban.SteamId.ToString());
-                }
-
-                aSqlData.Add(ban.Username);
-                aSqlData.Add(ban.Notes);
+                aSqlData.Add(player.Id);
+                aSqlData.Add(player.Name);
+                aSqlData.Add(player.Reason);
             }
 
             sqlNewValues = sqlNewValues.Remove(sqlNewValues.Length - 2);
-            return $"REPLACE INTO {CBanTableName} (UserId, Username, Notes) VALUES {sqlNewValues};";
+            return $"REPLACE INTO {CBanTableName} (UserId, Name, Reason) VALUES {sqlNewValues};";
         }
         #endregion Utility methods
 
@@ -233,8 +236,8 @@ namespace Oxide.Plugins
         private ConfigData FConfigData;
         private Connection FSqlCon;
         private List<BannedPlayer> FOldBans;
-        private readonly Core.MySql.Libraries.MySql FMySql = Interface.GetMod().GetLibrary<Core.MySql.Libraries.MySql>();
-        private readonly Core.SQLite.Libraries.SQLite FSqlite = Interface.GetMod().GetLibrary<Core.SQLite.Libraries.SQLite>();
+        private readonly Core.MySql.Libraries.MySql FMySql = Interface.Oxide.GetLibrary<Core.MySql.Libraries.MySql>();
+        private readonly Core.SQLite.Libraries.SQLite FSqlite = Interface.Oxide.GetLibrary<Core.SQLite.Libraries.SQLite>();
         #endregion Fields
 
         #region Database methods
@@ -242,11 +245,11 @@ namespace Oxide.Plugins
         /// Connect to the backend database
         /// </summary>
         /// <returns>Success</returns>
-        private bool ConnectToDatabase()
+        private bool ConnectToDatabase(out Connection aConn)
         {
             try {
                 if (FConfigData.DataStoreType == DataStoreType.MySql) {
-                    FSqlCon = FMySql.OpenDb(
+                    aConn = FMySql.OpenDb(
                         FConfigData.MySQLHost,
                         FConfigData.MySQLPort,
                         FConfigData.MySQLDb,
@@ -254,17 +257,18 @@ namespace Oxide.Plugins
                         FConfigData.MySQLPass,
                         this
                     );
-                    LogDebug($"ConnectToDatabase > Is FSqlCon NULL? {(FSqlCon == null ? "yes" : "no")}");
+                    LogDebug($"ConnectToDatabase > Is aConn NULL? {(aConn == null ? "yes" : "no")}");
 
-                    if (FSqlCon == null || FSqlCon.Con == null) {
-                        LogError($"ConnectToDatabase > Couldn't open the MySQL Database: {FSqlCon.Con.State.ToString()}");
+                    if (aConn == null || aConn.Con == null) {
+                        LogError($"ConnectToDatabase > Couldn't open the MySQL Database: {aConn.Con.State.ToString()}");
+                        aConn = null;
                         return false;
                     }
                 } else {
-                    FSqlCon = FSqlite.OpenDb(FConfigData.SQLiteDb, this);
-                    LogDebug($"ConnectToDatabase > Is FSqlCon NULL? {(FSqlCon == null ? "yes" : "no")}");
+                    aConn = FSqlite.OpenDb(FConfigData.SQLiteDb, this);
+                    LogDebug($"ConnectToDatabase > Is aConn NULL? {(aConn == null ? "yes" : "no")}");
 
-                    if (FSqlCon == null) {
+                    if (aConn == null) {
                         LogError("ConnectToDatabase > Couldn't open the SQLite Database.");
                         return false;
                     }
@@ -273,6 +277,7 @@ namespace Oxide.Plugins
                 return true;
             } catch (Exception e) {
                 LogError($"{e.ToString()}");
+                aConn = null;
                 return false;
             }
         }
@@ -282,15 +287,14 @@ namespace Oxide.Plugins
         /// </summary>
         private void InitBanSync()
         {
-            FOldBans = GetBannedUserList();
             LogDebug(
-                $"InitBanSync > FOldBans.Count = {FOldBans.Count}{Environment.NewLine}" +
-                $"InitBanSync > Is FConfigData NULL? {(FConfigData == null ? "yes" : "no")}{Environment.NewLine}" +
-                $"InitBanSync > Is FMySql NULL? {(FMySql == null ? "yes" : "no")}{Environment.NewLine}" +
-                $"InitBanSync > Is FSqlite NULL? {(FSqlite == null ? "yes" : "no")}"
+                $"InitBanSync > Is FConfigData NULL? {(FConfigData == null ? "yes" : "no")} ; " +
+                $"Is FMySql NULL? {(FMySql == null ? "yes" : "no")} ; Is FSqlite NULL? {(FSqlite == null ? "yes" : "no")}"
             );
 
-            if (ConnectToDatabase()) {
+            if (ConnectToDatabase(out FSqlCon)) {
+                FOldBans = GetBannedUserList();
+
                 if (FConfigData.DataStoreType == DataStoreType.MySql) {
                     FMySql.Query(
                         new Sql(
@@ -320,14 +324,12 @@ namespace Oxide.Plugins
             } else {
                 if (FConfigData.DataStoreType == DataStoreType.MySql) {
                     FMySql.ExecuteNonQuery(
-                        new Sql(
-                            $"CREATE TABLE {CBanTableName} (UserId BIGINT UNSIGNED NOT NULL PRIMARY KEY, Username TEXT NOT NULL, Notes LONGTEXT NOT NULL);"
-                        ),
+                        new Sql($"CREATE TABLE {CBanTableName} (UserId VARCHAR(1024) PRIMARY KEY, Name TEXT NOT NULL, Reason LONGTEXT NOT NULL);"),
                         FSqlCon
                     );
                 } else {
                     FSqlite.ExecuteNonQuery(
-                        new Sql($"CREATE TABLE {CBanTableName} (UserId TEXT NOT NULL PRIMARY KEY UNIQUE, Username TEXT NOT NULL, Notes TEXT NOT NULL);"),
+                        new Sql($"CREATE TABLE {CBanTableName} (UserId TEXT NOT NULL PRIMARY KEY UNIQUE, Name TEXT NOT NULL, Reason TEXT NOT NULL);"),
                         FSqlCon
                     );
                 }
@@ -366,28 +368,30 @@ namespace Oxide.Plugins
                 (
                     from row in aRows
                     select new BannedPlayer {
-                        SteamId = FConfigData.DataStoreType == DataStoreType.MySql ? (ulong)row["UserId"] : ulong.Parse((string)row["UserId"]),
-                        Username = (string)row["Username"],
-                        Notes = (string)row["Notes"]
+                        Id = (string)row["UserId"],
+                        Name = (string)row["Name"],
+                        Reason = (string)row["Reason"]
                     }
                 ).ToList()
             );
             LogDebug($"UpdateBans > diff.NewBans.Count = {diff.NewBans.Count} ; diff.RemovedBans.Count = {diff.RemovedBans.Count}");
-            diff.NewBans.ForEach(ban => {
-                BasePlayer player = BasePlayer.FindByID(ban.SteamId);
-                ServerUsers.Set(ban.SteamId, ServerUsers.UserGroup.Banned, ban.Username, ban.Notes);
-                FOldBans.Add(ban);
-                player?.Kick(string.Format("Banned: {0}", ban.Notes));
-            });
-            diff.RemovedBans.ForEach(unban => {
-                ServerUsers.Remove(unban.SteamId);
-                FOldBans.RemoveAll(ban => ban.SteamId == unban.SteamId);
-            });
 
-            if (diff.NewBans.Count > 0 || diff.RemovedBans.Count > 0) {
-                ServerUsers.Save();
+            if (diff.NotEmpty) {
+                foreach (BannedPlayer ban in diff.NewBans) {
+                    FOldBans.Add(ban);
+                    server.Ban(ban.Id, ban.Reason);
+                    IPlayer player = players.FindPlayerById(ban.Id);
+
+                    if (player?.IsConnected ?? false) // Prevent nullref
+                        player.Kick(string.Format("Banned: {0}", ban.Reason));
+                }
+
+                foreach (BannedPlayer unban in diff.RemovedBans) {
+                    FOldBans.RemoveAll(ban => ban.Id == unban.Id);
+                    server.Unban(unban.Id);
+                }
+
                 FOldBans = GetBannedUserList();
-                LogDebug($"UpdateBans > FOldBans.Count = {FOldBans.Count}");
             }
 
             if (FConfigData.DataStoreType == DataStoreType.MySql) {
@@ -396,6 +400,7 @@ namespace Oxide.Plugins
                 FSqlite.CloseDb(FSqlCon);
             }
 
+            FSqlCon = null;
             timer.Once(20, PushBans);
         }
         
@@ -406,14 +411,10 @@ namespace Oxide.Plugins
         private void PullBans(int aRowsAffected = 0)
         {
             LogDebug($"PullBans > aRowsAffected = {aRowsAffected}");
+            Sql query = new Sql($"SELECT UserId, Name, Reason FROM {CBanTableName}");
 
-            if (aRowsAffected > 0) {
-                ServerUsers.Save();
+            if (aRowsAffected > 0)
                 FOldBans = GetBannedUserList();
-            }
-
-            Sql query = new Sql($"SELECT UserId, Username, Notes FROM {CBanTableName}");
-            LogDebug($"PullBans > SQL = {query.SQL}");
 
             if (FConfigData.DataStoreType == DataStoreType.MySql) {
                 FMySql.Query(query, FSqlCon, UpdateBans);
@@ -427,43 +428,94 @@ namespace Oxide.Plugins
         /// </summary>
         private void PushBans()
         {
-            List<BannedPlayer> bans = GetBannedUserList();
-            BanDiff diff = new BanDiff(FOldBans, bans);
+            if (!ConnectToDatabase(out FSqlCon)) {
+                LogError("PushBans > Unable to connect to the database");
+                return;
+            }
+
+            BanDiff diff = new BanDiff(FOldBans, GetBannedUserList());
             Sql query = new Sql();
-            LogDebug($"PushBans > bans.Count = {bans.Count}");
             LogDebug($"PushBans > diff.NewBans.Count = {diff.NewBans.Count} ; diff.RemovedBans.Count = {diff.RemovedBans.Count}");
 
-            if (diff.NewBans.Count > 0) {
-                List<object> sqlNewData;
-                string replaceQueryStr = CreateReplaceQuery(FOldBans, out sqlNewData);
-                query.Append(replaceQueryStr, sqlNewData.ToArray());
-            }
-
-            if (diff.RemovedBans.Count > 0) {
-                string sqlRemoveValues = "";
-
-                for (int i = 0; i < diff.RemovedBans.Count; i++) {
-                    int startIndex = 3 * i;
-                    BannedPlayer unban = diff.RemovedBans[i];
-                    sqlRemoveValues += FConfigData.DataStoreType == DataStoreType.MySql ? $"{unban.SteamId}, " : $"'{unban.SteamId}', ";
+            if (diff.NotEmpty) {
+                if (diff.NewBans.Count > 0) {
+                    List<object> sqlNewData;
+                    string replaceQueryStr = CreateReplaceQuery(FOldBans, out sqlNewData);
+                    query.Append(replaceQueryStr, sqlNewData.ToArray());
                 }
 
-                sqlRemoveValues = sqlRemoveValues.Remove(sqlRemoveValues.Length - 2);
-                query.Append($"DELETE FROM {CBanTableName} WHERE UserId IN ({sqlRemoveValues});");
-            }
+                if (diff.RemovedBans.Count > 0) {
+                    string sqlRemoveValues = "";
 
-            if (diff.NewBans.Count > 0 || diff.RemovedBans.Count > 0) {
+                    for (int i = 0; i < diff.RemovedBans.Count; i++) {
+                        int startIndex = 3 * i;
+                        BannedPlayer unban = diff.RemovedBans[i];
+                        sqlRemoveValues += $"'{unban.Id}', ";
+                    }
+
+                    sqlRemoveValues = sqlRemoveValues.Remove(sqlRemoveValues.Length - 2);
+                    query.Append($"DELETE FROM {CBanTableName} WHERE UserId IN ({sqlRemoveValues});");
+                }
+
                 LogDebug($"PushBans > SQL = {query.SQL}");
 
-                if (ConnectToDatabase()) {
-                    if (FConfigData.DataStoreType == DataStoreType.MySql) {
-                        FMySql.ExecuteNonQuery(query, FSqlCon, PullBans);
-                    } else {
-                        FSqlite.ExecuteNonQuery(query, FSqlCon, PullBans);
-                    }
+                if (FConfigData.DataStoreType == DataStoreType.MySql) {
+                    FMySql.ExecuteNonQuery(query, FSqlCon, PullBans);
+                } else {
+                    FSqlite.ExecuteNonQuery(query, FSqlCon, PullBans);
                 }
             } else {
                 PullBans();
+            }
+        }
+        /// <summary>
+        /// Add the new ban to the database
+        /// </summary>
+        /// <param name="aUserId">The player's ID</param>
+        /// <param name="aName">The player's name</param>
+        /// <param name="aReason">The ban reason</param>
+        private void AddPlayerBan(string aUserId, string aName, string aReason)
+        {
+            Connection localCon;
+            List<object> sqlNewData = new List<object> {
+                aUserId,
+                aName,
+                aReason
+            };
+            Sql query = new Sql($"REPLACE INTO {CBanTableName} (UserId, Name, Reason) VALUES (@0, @1, @2);", sqlNewData.ToArray());
+            // Do a replace, in case the ban replaces a previous one
+            FOldBans.RemoveAll(ban => ban.Id == aUserId);
+            FOldBans.Add(new BannedPlayer { Id = aUserId, Name = aName, Reason = aReason });
+
+            if (ConnectToDatabase(out localCon)) {
+                if (FConfigData.DataStoreType == DataStoreType.MySql) {
+                    FMySql.ExecuteNonQuery(query, localCon);
+                    localCon.Con.Close();
+                } else {
+                    FSqlite.ExecuteNonQuery(query, localCon);
+                    FSqlite.CloseDb(localCon);
+                }
+            }
+        }
+
+        /// <summary>
+        /// Remove the ban from the database
+        /// </summary>
+        /// <param name="aUserId">The player's ID</param>
+        private void RemovePlayerBan(string aUserId)
+        {
+            Connection localCon;
+            Sql query = new Sql($"DELETE FROM {CBanTableName} WHERE UserId = '{aUserId}';");
+            FOldBans.RemoveAll(ban => ban.Id == aUserId);
+
+            if (ConnectToDatabase(out localCon)) {
+                if (FConfigData.DataStoreType == DataStoreType.MySql) {
+                    FMySql.ExecuteNonQuery(query, localCon);
+                    localCon.Con.Close();
+                } else {
+                    FSqlite.ExecuteNonQuery(query, localCon);
+                    FSqlite.CloseDb(localCon);
+                }
             }
         }
         #endregion Database methods
@@ -521,6 +573,31 @@ namespace Oxide.Plugins
         /// HOOK: Save the plugin config
         /// </summary>
         protected override void SaveConfig() => Config.WriteObject(FConfigData);
+
+        /// <summary>
+        /// HOOK: Process when a player has been banned
+        /// </summary>
+        /// <param name="name">The player's name</param>
+        /// <param name="id">The player's ID</param>
+        /// <param name="address">The player's IP address</param>
+        /// <param name="reason">The ban reason</param>
+        void OnUserBanned(string name, string id, string address, string reason)
+        {
+            if (FOldBans.Find(ban => { return ban.Id == id && ban.Name == name; }) == null)
+                AddPlayerBan(id, name, reason ?? "");
+        }
+
+        /// <summary>
+        /// HOOK: Process when a player has been unbanned
+        /// </summary>
+        /// <param name="name">The player's name</param>
+        /// <param name="id">The player's ID</param>
+        /// <param name="address">The player's IP address</param>
+        void OnUserUnbanned(string name, string id, string address)
+        {
+            if (FOldBans.Find(ban => { return ban.Id == id; }) != null)
+                RemovePlayerBan(id);
+        }
         #endregion Hooks
     }
 }
