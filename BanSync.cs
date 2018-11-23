@@ -32,7 +32,7 @@ using System.Linq;
 
 namespace Oxide.Plugins
 {
-    [Info("BanSync", "ThibmoRozier", "2.0.3")]
+    [Info("BanSync", "ThibmoRozier", "2.0.4")]
     [Description("Synchronizes bans across servers.")]
     public class BanSync : CovalencePlugin
     {
@@ -85,16 +85,17 @@ namespace Oxide.Plugins
             /// <summary>
             /// Determine if two objects are equal
             /// </summary>
-            /// <param name="a"></param>
-            /// <param name="b"></param>
+            /// <param name="x"></param>
+            /// <param name="y"></param>
             /// <returns></returns>
-            public bool Equals(BannedPlayer a, BannedPlayer b)
+            public bool Equals(BannedPlayer x, BannedPlayer y)
             {
                 // Check whether the objects are the same object. 
-                if (ReferenceEquals(a, b))
+                if (ReferenceEquals(x, y))
                     return true;
 
-                return a != null && b != null && a.Id.Equals(b.Id) && a.Name.Equals(b.Name);
+                return x != null && y != null && x.Id.Equals(y.Id, StringComparison.InvariantCultureIgnoreCase) &&
+                                                 x.Name.Equals(y.Name, StringComparison.InvariantCulture);
             }
 
             /// <summary>
@@ -124,7 +125,7 @@ namespace Oxide.Plugins
             /// </summary>
             /// <param name="aOldList">The old banned user list</param>
             /// <param name="aNewList">The current banned user list</param>
-            public BanDiff(List<BannedPlayer> aOldList, List<BannedPlayer> aNewList)
+            public BanDiff(IEnumerable<BannedPlayer> aOldList, IEnumerable<BannedPlayer> aNewList)
             {
                 CompareBannedPlayers comparer = new CompareBannedPlayers();
                 NewBans = aNewList.Except(aOldList, comparer).ToList();
@@ -205,10 +206,10 @@ namespace Oxide.Plugins
         /// <param name="aBans">The list of bans to insert or replace</param>
         /// <param name="aSqlData">The resulting list of SQL data</param>
         /// <returns>The SQL query string</returns>
-        private string CreateReplaceQuery(List<BannedPlayer> aBans, out List<object> aSqlData)
+        private string CreateReplaceQuery(IEnumerable<BannedPlayer> aBans, out List<object> aSqlData)
         {
             int counter = 0;
-            string sqlNewValues = "";
+            string sqlNewValues = string.Empty;
             aSqlData = new List<object>();
 
             foreach (BannedPlayer player in aBans) {
@@ -317,9 +318,9 @@ namespace Oxide.Plugins
         /// Create the ban table from scratch
         /// </summary>
         /// <param name="aRows">The list of tables with our table name from the same schema (database)</param>
-        private void CreateDb(List<Dictionary<string, object>> aRows)
+        private void CreateDb(IEnumerable<Dictionary<string, object>> aRows)
         {
-            if (aRows.Count > 0) {
+            if (aRows.Count() > 0) {
                 PullBans();
             } else {
                 if (FConfigData.DataStoreType == DataStoreType.MySql) {
@@ -361,7 +362,7 @@ namespace Oxide.Plugins
         /// Update the currently active bans by adding the new bans and removing unbanned users
         /// </summary>
         /// <param name="aRows">The active ban rows from the database</param>
-        private void UpdateBans(List<Dictionary<string, object>> aRows)
+        private void UpdateBans(IEnumerable<Dictionary<string, object>> aRows)
         {
             BanDiff diff = new BanDiff(
                 GetBannedUserList(),
@@ -445,7 +446,7 @@ namespace Oxide.Plugins
                 }
 
                 if (diff.RemovedBans.Count > 0) {
-                    string sqlRemoveValues = "";
+                    string sqlRemoveValues = string.Empty;
 
                     for (int i = 0; i < diff.RemovedBans.Count; i++) {
                         int startIndex = 3 * i;
@@ -554,7 +555,8 @@ namespace Oxide.Plugins
 
                 if (FConfigData == null)
                     LoadDefaultConfig();
-            } catch {
+            } catch (Exception ex) {
+                LogWarning($"LoadConfig > Exception: {ex}");
                 LoadDefaultConfig();
             }
         }
@@ -584,7 +586,7 @@ namespace Oxide.Plugins
         void OnUserBanned(string name, string id, string address, string reason)
         {
             if (FOldBans.Find(ban => { return ban.Id == id && ban.Name == name; }) == null)
-                AddPlayerBan(id, name, reason ?? "");
+                AddPlayerBan(id, name, reason ?? string.Empty);
         }
 
         /// <summary>
