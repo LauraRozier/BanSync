@@ -32,7 +32,7 @@ using System.Linq;
 
 namespace Oxide.Plugins
 {
-    [Info("BanSync", "ThibmoRozier", "2.0.4")]
+    [Info("BanSync", "ThibmoRozier", "2.0.5")]
     [Description("Synchronizes bans across servers.")]
     public class BanSync : CovalencePlugin
     {
@@ -498,27 +498,6 @@ namespace Oxide.Plugins
                 }
             }
         }
-
-        /// <summary>
-        /// Remove the ban from the database
-        /// </summary>
-        /// <param name="aUserId">The player's ID</param>
-        private void RemovePlayerBan(string aUserId)
-        {
-            Connection localCon;
-            Sql query = new Sql($"DELETE FROM {CBanTableName} WHERE UserId = '{aUserId}';");
-            FOldBans.RemoveAll(ban => ban.Id == aUserId);
-
-            if (ConnectToDatabase(out localCon)) {
-                if (FConfigData.DataStoreType == DataStoreType.MySql) {
-                    FMySql.ExecuteNonQuery(query, localCon);
-                    localCon.Con.Close();
-                } else {
-                    FSqlite.ExecuteNonQuery(query, localCon);
-                    FSqlite.CloseDb(localCon);
-                }
-            }
-        }
         #endregion Database methods
 
         #region Hooks
@@ -587,18 +566,6 @@ namespace Oxide.Plugins
         {
             if (FOldBans.Find(ban => { return ban.Id == id && ban.Name == name; }) == null)
                 AddPlayerBan(id, name, reason ?? string.Empty);
-        }
-
-        /// <summary>
-        /// HOOK: Process when a player has been unbanned
-        /// </summary>
-        /// <param name="name">The player's name</param>
-        /// <param name="id">The player's ID</param>
-        /// <param name="address">The player's IP address</param>
-        void OnUserUnbanned(string name, string id, string address)
-        {
-            if (FOldBans.Find(ban => { return ban.Id == id; }) != null)
-                RemovePlayerBan(id);
         }
         #endregion Hooks
     }
